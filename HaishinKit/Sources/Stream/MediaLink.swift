@@ -4,6 +4,13 @@ import Foundation
 final actor MediaLink {
     static let capacity = 90
     static let duration: TimeInterval = 0.0
+    /// The upper bound of the playout delay that absorbs arrival jitter.
+    static let maximumDelay: TimeInterval = 0.5
+    /// The delay is lowered at most this much per adjustment interval, so that frames are not released in a burst.
+    static let delayDecreaseStep: TimeInterval = 0.01
+    static let delayAdjustmentInterval: TimeInterval = 1.0
+    /// The headroom kept above the measured jitter when the delay is lowered.
+    static let delayMargin: TimeInterval = 0.02
 
     var dequeue: AsyncStream<CMSampleBuffer> {
         AsyncStream { continutation in
@@ -20,7 +27,18 @@ final actor MediaLink {
     private var duration: TimeInterval = MediaLink.duration
     private var presentationTimeStampOrigin: CMTime = .invalid
     private lazy var displayLink = DisplayLinkChoreographer()
-    private weak var audioPlayer: AudioPlayerNode?
+    private weak var audioPlayer: AudioPlayerNode? {
+        didSet {
+            delay = 0.0
+        }
+    }
+    /// Without an audio player frames are presented on a free-running clock that starts at the first frame.
+    /// Frames arriving late (network or server bursts) push the playout point back by their lateness, up to
+    /// maximumDelay, so that the frames of a burst are spread out by their timestamps instead of being
+    /// presented at once. While every frame arrives early the delay slowly shrinks back.
+    private var delay: TimeInterval = 0.0
+    private var minimumSlack: TimeInterval = .infinity
+    private var delayAdjustedAt: TimeInterval = 0.0
 
     init() {
         do {
@@ -36,6 +54,18 @@ final actor MediaLink {
         }
         if presentationTimeStampOrigin == .invalid {
             presentationTimeStampOrigin = sampleBuffer.presentationTimeStamp
+            if audioPlayer == nil {
+                duration = 0.0
+                delayAdjustedAt = 0.0
+            }
+        }
+        if audioPlayer == nil {
+            let slack = sampleBuffer.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds + delay - duration
+            if slack < 0 {
+                delay = min(delay - slack, Self.maximumDelay)
+            } else {
+                minimumSlack = min(minimumSlack, slack)
+            }
         }
         do {
             try storage?.enqueue(sampleBuffer)
@@ -71,12 +101,19 @@ extension MediaLink: AsyncRunner {
                     continue
                 }
                 let currentTime = await getCurrentTime(currentTime.targetTimestamp - currentTime.timestamp)
+                if Self.delayAdjustmentInterval <= currentTime - delayAdjustedAt {
+                    if Self.delayMargin < minimumSlack && 0 < delay {
+                        delay = max(0, delay - min(minimumSlack - Self.delayMargin, Self.delayDecreaseStep))
+                    }
+                    minimumSlack = .infinity
+                    delayAdjustedAt = currentTime
+                }
                 var frameCount = 0
                 while !storage.isEmpty {
                     guard let first = storage.head else {
                         break
                     }
-                    if first.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds <= currentTime {
+                    if first.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds + delay <= currentTime {
                         continutation?.yield(first)
                         frameCount += 1
                         _ = storage.dequeue()
@@ -98,6 +135,8 @@ extension MediaLink: AsyncRunner {
         continutation = nil
         displayLink.stopRunning()
         presentationTimeStampOrigin = .invalid
+        delay = 0.0
+        minimumSlack = .infinity
         try? storage?.reset()
         isRunning = false
     }

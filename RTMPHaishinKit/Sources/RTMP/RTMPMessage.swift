@@ -486,6 +486,10 @@ struct RTMPVideoMessage: RTMPMessage {
     }
 
     var compositionTime: Int32 {
+        // Enhanced RTMP: only CodedFrames carries a composition time; CodedFramesX means it is zero.
+        if isExHeader && packetType != RTMPVideoPacketType.codedFrames.rawValue {
+            return 0
+        }
         let offset = self.offset
         var compositionTime = Int32(data: [0] + payload[2 + offset..<5 + offset]).bigEndian
         compositionTime <<= 8
