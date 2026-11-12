@@ -208,7 +208,6 @@ public actor RTMPStream {
     }
     package var outputs: [any StreamOutput] = []
     private var frameCount: UInt16 = 0
-    private var audioBuffer: AVAudioCompressedBuffer?
     private var howToPublish: RTMPStream.HowToPublish = .live
     private var continuation: CheckedContinuation<RTMPResponse, any Swift.Error>? {
         didSet {
@@ -240,12 +239,6 @@ public actor RTMPStream {
                     return
                 }
                 doOutput(oldValue == nil ? .zero : .one, chunkStreamId: .audio, message: message)
-            case .playing:
-                if let audioFormat {
-                    audioBuffer = AVAudioCompressedBuffer(format: audioFormat, packetCapacity: 1, maximumPacketSize: 1024 * Int(audioFormat.channelCount))
-                } else {
-                    audioBuffer = nil
-                }
             default:
                 break
             }
@@ -649,9 +642,10 @@ public actor RTMPStream {
             if audioFormat == nil {
                 audioFormat = message.makeAudioFormat()
             }
-            if let audioBuffer {
-                message.copyMemory(audioBuffer)
-                Task { await incoming.append(audioBuffer, when: audioTimestamp.value) }
+            if let audioFormat {
+                let audioBuffer = message.makeAudioBuffer(audioFormat)
+                let when = audioTimestamp.value
+                Task { await incoming.append(audioBuffer, when: when) }
             }
         default:
             break

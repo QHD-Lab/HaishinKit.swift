@@ -428,9 +428,13 @@ struct RTMPAudioMessage: RTMPMessage {
         }
     }
 
-    func copyMemory(_ audioBuffer: AVAudioCompressedBuffer?) {
+    /// A new buffer holding this message's frame. It is a new one every time: the decoder reads it on another actor
+    /// after the message is handled, so a shared buffer would be overwritten by the next message first (one frame
+    /// lost, the next decoded twice).
+    func makeAudioBuffer(_ format: AVAudioFormat) -> AVAudioCompressedBuffer {
+        let audioBuffer = AVAudioCompressedBuffer(format: format, packetCapacity: 1, maximumPacketSize: 1024 * Int(format.channelCount))
         payload.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-            guard let baseAddress = buffer.baseAddress, let audioBuffer else {
+            guard let baseAddress = buffer.baseAddress else {
                 return
             }
             let byteCount = payload.count - codec.headerSize
@@ -439,6 +443,7 @@ struct RTMPAudioMessage: RTMPMessage {
             audioBuffer.byteLength = UInt32(byteCount)
             audioBuffer.data.copyMemory(from: baseAddress.advanced(by: codec.headerSize), byteCount: byteCount)
         }
+        return audioBuffer
     }
 
     func makeAudioFormat() -> AVAudioFormat? {
