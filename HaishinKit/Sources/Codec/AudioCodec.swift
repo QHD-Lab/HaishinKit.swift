@@ -59,6 +59,11 @@ final class AudioCodec {
             }
             var offset = 0
             var presentationTimeStamp = sampleBuffer.presentationTimeStamp
+            // Each frame lasts mFramesPerPacket samples at the input's sample rate, whatever the timestamp's timescale
+            // (90 kHz from MPEG-TS, where one PES carries several frames).
+            let frameDuration = inputFormat.map {
+                CMTime(value: CMTimeValue($0.streamDescription.pointee.mFramesPerPacket), timescale: CMTimeScale($0.sampleRate))
+            } ?? .invalid
             for i in 0..<sampleBuffer.numSamples {
                 guard let buffer = makeInputBuffer() as? AVAudioCompressedBuffer else {
                     continue
@@ -68,6 +73,7 @@ final class AudioCodec {
                 // A malformed frame (for example, from packet loss) is dropped instead of overflowing the buffer.
                 guard 0 < byteCount, byteCount <= Int(buffer.byteCapacity) else {
                     offset += sampleSize
+                    presentationTimeStamp = CMTimeAdd(presentationTimeStamp, frameDuration)
                     continue
                 }
                 buffer.packetDescriptions?.pointee = AudioStreamPacketDescription(mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(byteCount))
@@ -76,7 +82,7 @@ final class AudioCodec {
                 if let blockBuffer = sampleBuffer.dataBuffer {
                     CMBlockBufferCopyDataBytes(blockBuffer, atOffset: offset + ADTSHeader.size, dataLength: byteCount, destination: buffer.data)
                     append(buffer, when: presentationTimeStamp.makeAudioTime())
-                    presentationTimeStamp = CMTimeAdd(presentationTimeStamp, CMTime(value: CMTimeValue(1024), timescale: sampleBuffer.presentationTimeStamp.timescale))
+                    presentationTimeStamp = CMTimeAdd(presentationTimeStamp, frameDuration)
                     offset += sampleSize
                 }
             }

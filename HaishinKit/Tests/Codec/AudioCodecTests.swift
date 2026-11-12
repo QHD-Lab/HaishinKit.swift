@@ -132,6 +132,49 @@ import Testing
         #expect(!destination.copy(source))
     }
 
+    /// One MPEG-TS PES carries several ADTS frames under one 90 kHz timestamp: each decoded frame must play 1024 samples
+    /// at 48 kHz after the previous one, so that a player scheduling by time neither overlaps nor drops them.
+    @Test func pcm_timesEachFrameOfAPESBySampleRate() async throws {
+        let encoder = HaishinKit.AudioCodec()
+        encoder.startRunning()
+        let encoded = encoder.outputStream
+        for _ in 0..<20 {
+            if let buffer = AVAudioPCMBufferFactory.makeSinWave(48000, numSamples: 1024) {
+                encoder.append(buffer, when: .init())
+            }
+        }
+        encoder.stopRunning()
+        var frames: [Data] = []
+        for await (buffer, _) in encoded {
+            guard let buffer = buffer as? AVAudioCompressedBuffer, buffer.packetCount == 1 else {
+                continue
+            }
+            frames.append(Data(bytes: buffer.data, count: Int(buffer.byteLength)))
+        }
+        let count = 8
+        try #require(count <= frames.count)
+
+        let decoder = try Self.decoder()
+        let decoded = decoder.outputStream
+        let start = CMTime(value: 900_000, timescale: 90_000)
+        decoder.append(try Self.aacSampleBuffer(frames: Array(frames.prefix(count)), sampleFrequencyIndex: 3, presentationTimeStamp: start))
+        decoder.stopRunning()
+        var output: [(time: Double, duration: Double)] = []
+        for await (buffer, when) in decoded {
+            guard let buffer = buffer as? AVAudioPCMBuffer else {
+                continue
+            }
+            output.append((Double(when.sampleTime) / when.sampleRate, Double(buffer.frameLength) / buffer.format.sampleRate))
+        }
+        #expect(output.count == count)
+        for (i, frame) in output.enumerated() {
+            #expect(abs(frame.time - (10 + Double(i) * 1024 / 48000)) < 1e-9, "frame \(i)")
+        }
+        for i in 1..<output.count {
+            #expect(abs(output[i].time - (output[i - 1].time + output[i - 1].duration)) < 1e-9, "frame \(i)")
+        }
+    }
+
     private static func decoder() throws -> HaishinKit.AudioCodec {
         let decoder = HaishinKit.AudioCodec()
         decoder.settings.format = .pcm
@@ -139,10 +182,38 @@ import Testing
         return decoder
     }
 
-    private static func aacFormatDescription(channels: UInt8) throws -> CMFormatDescription {
-        // ADTS header of AAC LC, 44.1 kHz.
-        let header = Data([0xFF, 0xF1, 0x50, channels << 6, 0x00, 0x1F, 0xFC])
-        return try #require(ADTSHeader(data: header).makeFormatDescription())
+    /// ADTS header of AAC LC; sampling frequency index 4 is 44.1 kHz, 3 is 48 kHz.
+    private static func adtsHeader(channels: UInt8, sampleFrequencyIndex: UInt8 = 4) -> Data {
+        Data([0xFF, 0xF1, 0x40 | sampleFrequencyIndex << 2, channels << 6, 0x00, 0x1F, 0xFC])
+    }
+
+    private static func aacFormatDescription(channels: UInt8, sampleFrequencyIndex: UInt8 = 4) throws -> CMFormatDescription {
+        try #require(ADTSHeader(data: adtsHeader(channels: channels, sampleFrequencyIndex: sampleFrequencyIndex)).makeFormatDescription())
+    }
+
+    /// Mono ADTS frames in one sample buffer with one timestamp, the way a PES arrives from MPEG-TS.
+    private static func aacSampleBuffer(frames: [Data], sampleFrequencyIndex: UInt8, presentationTimeStamp: CMTime) throws -> CMSampleBuffer {
+        let header = adtsHeader(channels: 1, sampleFrequencyIndex: sampleFrequencyIndex)
+        var sampleSizes = frames.map { header.count + $0.count }
+        let blockBuffer = try #require(frames.reduce(into: Data()) { $0 += header + $1 }.makeBlockBuffer())
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: presentationTimeStamp, decodeTimeStamp: .invalid)
+        var sampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreate(
+            allocator: kCFAllocatorDefault,
+            dataBuffer: blockBuffer,
+            dataReady: true,
+            makeDataReadyCallback: nil,
+            refcon: nil,
+            formatDescription: try aacFormatDescription(channels: 1, sampleFrequencyIndex: sampleFrequencyIndex),
+            sampleCount: frames.count,
+            sampleTimingEntryCount: 1,
+            sampleTimingArray: &timing,
+            sampleSizeEntryCount: sampleSizes.count,
+            sampleSizeArray: &sampleSizes,
+            sampleBufferOut: &sampleBuffer
+        )
+        #expect(status == noErr)
+        return try #require(sampleBuffer)
     }
 
     private static func aacSampleBuffer(channels: UInt8, sampleSizes: [Int]) throws -> CMSampleBuffer {
