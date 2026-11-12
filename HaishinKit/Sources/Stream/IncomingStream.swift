@@ -76,7 +76,7 @@ extension IncomingStream: AsyncRunner {
             await audioPlayerNode?.startRunning()
             for await audio in audioCodec.outputStream {
                 await audioPlayerNode?.enqueue(audio.0, when: audio.1)
-                await stream?.didReceive(audio.0, when: audio.1)
+                await stream?.didReceive(audio.0, when: mediaLink.playoutTime(audio.1, sampleRate: audio.0.format.sampleRate))
             }
         }
     }

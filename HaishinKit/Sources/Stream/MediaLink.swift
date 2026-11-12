@@ -1,16 +1,12 @@
+import AVFoundation
 import CoreMedia
 import Foundation
+import QuartzCore
 
 final actor MediaLink {
     static let capacity = 90
-    static let duration: TimeInterval = 0.0
-    /// The upper bound of the playout delay that absorbs arrival jitter.
-    static let maximumDelay: TimeInterval = 0.5
-    /// The delay is lowered at most this much per adjustment interval, so that frames are not released in a burst.
-    static let delayDecreaseStep: TimeInterval = 0.01
-    static let delayAdjustmentInterval: TimeInterval = 1.0
-    /// The headroom kept above the measured jitter when the delay is lowered.
-    static let delayMargin: TimeInterval = 0.02
+    /// Decoded audio is handed to a player outside HaishinKit this long before its playout time, so that it can be scheduled.
+    static let audioLead: TimeInterval = 0.05
 
     var dequeue: AsyncStream<CMSampleBuffer> {
         AsyncStream { continutation in
@@ -24,21 +20,15 @@ final actor MediaLink {
             oldValue?.finish()
         }
     }
-    private var duration: TimeInterval = MediaLink.duration
     private var presentationTimeStampOrigin: CMTime = .invalid
     private lazy var displayLink = DisplayLinkChoreographer()
     private weak var audioPlayer: AudioPlayerNode? {
         didSet {
-            delay = 0.0
+            clock.reset()
         }
     }
-    /// Without an audio player frames are presented on a free-running clock that starts at the first frame.
-    /// Frames arriving late (network or server bursts) push the playout point back by their lateness, up to
-    /// maximumDelay, so that the frames of a burst are spread out by their timestamps instead of being
-    /// presented at once. While every frame arrives early the delay slowly shrinks back.
-    private var delay: TimeInterval = 0.0
-    private var minimumSlack: TimeInterval = .infinity
-    private var delayAdjustedAt: TimeInterval = 0.0
+    /// Without an audio player video and audio are presented on this clock.
+    private var clock = PlayoutClock()
 
     init() {
         do {
@@ -54,18 +44,9 @@ final actor MediaLink {
         }
         if presentationTimeStampOrigin == .invalid {
             presentationTimeStampOrigin = sampleBuffer.presentationTimeStamp
-            if audioPlayer == nil {
-                duration = 0.0
-                delayAdjustedAt = 0.0
-            }
         }
         if audioPlayer == nil {
-            let slack = sampleBuffer.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds + delay - duration
-            if slack < 0 {
-                delay = min(delay - slack, Self.maximumDelay)
-            } else {
-                minimumSlack = min(minimumSlack, slack)
-            }
+            _ = clock.arrive(sampleBuffer.presentationTimeStamp.seconds, at: CACurrentMediaTime())
         }
         do {
             try storage?.enqueue(sampleBuffer)
@@ -74,15 +55,19 @@ final actor MediaLink {
         }
     }
 
-    func setAudioPlayer(_ audioPlayer: AudioPlayerNode?) {
-        self.audioPlayer = audioPlayer
+    /// The time to play decoded audio at, on the clock the video is presented on, for a player outside HaishinKit.
+    /// The result carries the playout host time and the audio's own sample time. With an audio player it is `when` unchanged.
+    func playoutTime(_ when: AVAudioTime, sampleRate: Double) -> AVAudioTime {
+        guard isRunning, audioPlayer == nil, 0 < sampleRate, when.isSampleTimeValid || when.isHostTimeValid else {
+            return when
+        }
+        let timestamp = when.isSampleTimeValid ? Double(when.sampleTime) / when.sampleRate : AVAudioTime.seconds(forHostTime: when.hostTime)
+        let hostTime = clock.arrive(timestamp, at: CACurrentMediaTime(), lead: Self.audioLead)
+        return AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: max(0, hostTime)), sampleTime: AVAudioFramePosition(timestamp * sampleRate), atRate: sampleRate)
     }
 
-    private func getCurrentTime(_ timestamp: TimeInterval) async -> TimeInterval {
-        defer {
-            duration += timestamp
-        }
-        return await audioPlayer?.currentTime ?? duration
+    func setAudioPlayer(_ audioPlayer: AudioPlayerNode?) {
+        self.audioPlayer = audioPlayer
     }
 }
 
@@ -93,27 +78,28 @@ extension MediaLink: AsyncRunner {
             return
         }
         isRunning = true
-        duration = 0.0
         displayLink.startRunning()
         Task {
-            for await currentTime in displayLink.updateFrames {
+            for await time in displayLink.updateFrames {
                 guard let storage else {
                     continue
                 }
-                let currentTime = await getCurrentTime(currentTime.targetTimestamp - currentTime.timestamp)
-                if Self.delayAdjustmentInterval <= currentTime - delayAdjustedAt {
-                    if Self.delayMargin < minimumSlack && 0 < delay {
-                        delay = max(0, delay - min(minimumSlack - Self.delayMargin, Self.delayDecreaseStep))
-                    }
-                    minimumSlack = .infinity
-                    delayAdjustedAt = currentTime
+                let audioTime = await audioPlayer?.currentTime
+                if audioTime == nil {
+                    clock.adjust(at: time.timestamp)
                 }
                 var frameCount = 0
                 while !storage.isEmpty {
                     guard let first = storage.head else {
                         break
                     }
-                    if first.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds + delay <= currentTime {
+                    let isDue: Bool
+                    if let audioTime {
+                        isDue = first.presentationTimeStamp.seconds - presentationTimeStampOrigin.seconds <= audioTime
+                    } else {
+                        isDue = clock.hostTime(first.presentationTimeStamp.seconds) ?? 0 <= time.targetTimestamp
+                    }
+                    if isDue {
                         continutation?.yield(first)
                         frameCount += 1
                         _ = storage.dequeue()
@@ -135,8 +121,7 @@ extension MediaLink: AsyncRunner {
         continutation = nil
         displayLink.stopRunning()
         presentationTimeStampOrigin = .invalid
-        delay = 0.0
-        minimumSlack = .infinity
+        clock.reset()
         try? storage?.reset()
         isRunning = false
     }

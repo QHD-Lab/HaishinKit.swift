@@ -126,7 +126,10 @@ final class AudioCodec {
             }
             switch outputStatus {
             case .haveData:
-                if audioTime.hasAnchor {
+                if audioBuffer is AVAudioCompressedBuffer && settings.format == .pcm {
+                    // Decoding yields one PCM buffer per packet: it plays at the packet's time.
+                    _outputStream.yield((outputBuffer, when))
+                } else if audioTime.hasAnchor {
                     audioTime.advanced(AVAudioFramePosition(audioConverter.outputFormat.streamDescription.pointee.mFramesPerPacket))
                     _outputStream.yield((outputBuffer, audioTime.at))
                 } else {
